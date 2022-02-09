@@ -1,0 +1,1642 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "A MLOPS lab"
+
+Parameters:
+  S3PathPrefix:
+    Type: String
+    Description: "The path prefix where lab resources are stored"
+    Default: "courses/ILT-DD-200-MLPOPS/v1.0.6/lab-3"
+    # Default: "courses/ILT-DD-200-MLPOPS/v1.0.0/lab-3"
+  S3ResourceBucket:
+    Type: String
+    Description: "S3 Bucket suffix (e.g. us-west-2-tcprod) of where to pull lab resources from"
+    Default: "-tcprod"
+  imageTagName:
+    Type: String
+    Description: Name of the ECR image tag
+    Default: "latest"
+  InstanceType:
+    Description: Amazon EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+  LinuxAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  VPCCIDR:
+    Description: 'CIDR Block for VPC'
+    Type: String
+    Default: 10.0.0.0/16
+  PubSubA:
+    Description: 'Public Subnet A'
+    Type: String
+    Default: 10.0.1.0/24
+
+  fraudResourceTag:
+    Description: Tag to assign all resources so that they can be secured.
+    Type: String
+    Default: Fraud-Prevention
+  maxBuildJobs:
+    Description: The maximum number of times that codebuild jobs can run
+    Type: Number
+    Default: 4
+  buildTimeout:
+    Description: The timeout that is set for CodeBuild projects
+    Type: Number
+    Default: 5
+  fraudTimeout:
+    Description: The timeout that should be set for CodeBuild projects
+    Type: Number
+    Default: 60
+
+Resources:
+  ### START Networking Section START ###
+  # Defining the VPC Used for this lab, it contains one public subnet
+  labVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: True
+      EnableDnsHostnames: True
+      Tags:
+        - Key: Name
+          Value: labVPC
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    DependsOn: labVPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: labVPC-IGW
+
+  # Attached this IGW to the VPC
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref labVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create public subnets.
+  PublicSubnetA:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref labVPC
+      CidrBlock: !Ref PubSubA
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Reach
+          Value: Public
+        - Key: Name
+          Value: PublicSubnetA
+
+  # Create the Public Routing Tables.
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    DependsOn:
+      - AttachGateway
+    Properties:
+      VpcId: !Ref labVPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  # And add in the default route to 0.0.0.0/0
+  PublicRouteIGW:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Attach the routing table to each of the subnets
+  PublicRouteTableAssociationA:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  ### END Networking Section END ###
+
+  # Create a CodeBuild project that will be used by CodePipeline to build the algorithm into an ECR image
+  buildImageProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: Build a Model Image
+      ServiceRole: !GetAtt buildImageProjectRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      ConcurrentBuildLimit: 1
+      TimeoutInMinutes: !Ref buildTimeout
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ecrModelRepo
+          - Name: IMAGE_TAG
+            Value: !Ref imageTagName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Sub ${AWS::AccountId}
+          - Name: AWS_DEFAULT_REGION
+            Value: !Sub ${AWS::Region}
+          - Name: TEMPLATE_BUCKET
+            Value: !Ref ecrBucket
+          - Name: TEMPLATE_PREFIX
+            Value: codebuild
+          - Name: IMAGE_NAME
+            Value: trained_model
+          - Name: ECR_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrModelRepo}
+      Tags:
+        - Key: Name
+          Value: !Sub ECRRepo-${ecrModelRepo}
+
+  # Create a CodeBuild project that will be used by CodePipeline to build the Step Functions)
+  buildStepFunctionProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: Build a Model Image
+      ServiceRole: !GetAtt buildImageProjectRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      ConcurrentBuildLimit: 1
+      TimeoutInMinutes: !Ref buildTimeout
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: True
+
+  # Model ECR artifact bucket
+  ecrBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt SageMakerKMSKey.Arn
+            BucketKeyEnabled: true
+
+  # Create a pipeline to train your model
+  deployModelPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt deployModelPipelineRole.Arn
+      ArtifactStore:
+          Type: S3
+          Location: !Ref modelArtifactBucket
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: GetSource
+              Namespace: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: ModelSourceOutput
+              Configuration:
+                BranchName: main
+                RepositoryName: !Sub modelCode-${createRepoLambdaCaller.repoId}
+                PollForSourceChanges: false
+              RunOrder: 1
+        -
+          Name: Build
+          Actions:
+            -
+              Name: BuildImage
+              InputArtifacts:
+                - Name: ModelSourceOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: ModelBuildOutput
+              Configuration:
+                ProjectName: !Ref buildImageProject
+                EnvironmentVariables: "[{\"name\":\"RunId\",\"value\":\"#{codepipeline.PipelineExecutionId}\",\"type\":\"PLAINTEXT\"}]"
+              RunOrder: 1
+        -
+          Name: Train
+          Actions:
+            -
+              Name: Train
+              InputArtifacts:
+                - Name: ModelSourceOutput
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: 1
+                Provider: StepFunctions
+              Configuration:
+                Input: !Join
+                  - ''
+                  - - '{"BuildId":"#{codepipeline.PipelineExecutionId}",'
+                    - '"Job":"Job-#{codepipeline.PipelineExecutionId}",'
+                    - '"Model":"Model-#{codepipeline.PipelineExecutionId}",'
+                    - '"Endpoint":"Endpoint-#{codepipeline.PipelineExecutionId}",'
+                    - !Sub '"ecrArn":"${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrModelRepo}:#{codepipeline.PipelineExecutionId}",'
+                    - !Sub '"dataBucketPath":"s3://${modelDataBucket}/v1.0/train",'
+                    - '"triggerSource":"pipeline",'
+                    - !Sub '"DynamoDBTable":"${DynamoDBTable}",'
+                    - '"commitId":"#{Source.CommitId}",'
+                    - '"authorDate":"#{Source.AuthorDate}"}'
+                StateMachineArn: !Ref trainingStateMachine
+              OutputArtifacts:
+                - Name: trainingJobArtifact
+              RunOrder: 1
+
+  buildImageProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+              - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: allowedWriteCommands
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - iam:PassRole
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - states:UpdateStateMachine
+                  - states:DeleteStateMachine
+                  - states:CreateStateMachine
+                  - s3:CreateBucket
+                  - s3:PutBucketOwnershipControls
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketACL
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:aws:s3:::codepipeline-${AWS::Region}-*'
+              - Effect: Allow
+                Action:
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImageTagMutability
+                  - ecr:PutImage
+                  - ecr:TagResource
+                  - ecr:UploadLayerPart
+                  - ecr:UntagResource
+                Resource: !GetAtt ecrModelRepo.Arn
+
+  deployModelPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+              - codepipeline.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: allowedWriteCommands
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - codebuild:StartBuild
+                  - codecommit:UploadArchive
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - iam:PassRole
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - s3:PutObject
+                  - sns:Publish
+                  - states:StartExecution
+                Resource: '*'
+
+  # Create a pipeline to build the Step Function
+  StepFunctionsPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt StepFunctionsPipelineRole.Arn
+      ArtifactStore:
+          Type: S3
+          Location: !Ref modelArtifactBucket
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: GetSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: ModelSourceOutput
+              Configuration:
+                BranchName: main
+                RepositoryName: !Sub stateMachineCode-${createRepoLambdaCaller.repoId}
+              RunOrder: 1
+        -
+          Name: Build
+          Actions:
+            -
+              Name: BuildImage
+              InputArtifacts:
+                - Name: ModelSourceOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: ModelBuildOutput
+              Configuration:
+                ProjectName: !Ref buildStepFunctionProject
+              RunOrder: 1
+
+  StepFunctionsPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+              - codepipeline.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: S3GetPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - codecommit:UploadArchive
+                  - codebuild:StartBuild
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - s3:PutObject
+                Resource: '*'
+
+  # This is a placeholder for the Step Function. The ARN needs to be already
+  # established for the API to work seamlessly
+  trainingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties: 
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: 
+        !Sub |
+            {
+              "StartAt": "Train Step",
+              "States": {
+                "Train Step": {
+                  "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+                  "Parameters": {
+                    "RoleArn": "${SageMakerRole.Arn}",
+                    "TrainingJobName.$": "$$.Execution.Input['JobName']",
+                    "AlgorithmSpecification": {
+                      "TrainingImage": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrModelRepo}:latest", 
+                      "TrainingInputMode": "File"
+                    },
+                    "ResourceConfig": {
+                      "InstanceCount": 1,
+                      "InstanceType": "ml.m5.large",
+                      "VolumeSizeInGB": 10
+                    },
+                    "InputDataConfig": [
+                      {
+                        "ChannelName": "training",
+                        "DataSource": {
+                          "S3DataSource": {
+                            "S3DataType": "S3Prefix",
+                            "S3Uri": "s3://modelDataBucket/v1.0/train",
+                            "S3DataDistributionType": "FullyReplicated"
+                          }
+                        },
+                        "ContentType": "csv",
+                        "CompressionType": "None"
+                      }
+                    ],
+                    "StoppingCondition": {
+                      "MaxRuntimeInSeconds": 3600
+                    },
+                    "OutputDataConfig": {
+                      "S3OutputPath": "s3://${modelArtifactBucket}/$$.Execution.Input['JobName']"
+                    }
+                  },
+                  "Type": "Task",
+                  "Next": "Save model"
+                },
+                "Save model": {
+                  "Parameters": {
+                    "ExecutionRoleArn": "${SageMakerRole.Arn}",
+                    "ModelName.$": "$$.Execution.Input['ModelName']",
+                    "PrimaryContainer": {
+                      "Environment": {},
+                      "Image": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrModelRepo}:latest",
+                      "ModelDataUrl.$": "$['ModelArtifacts']['S3ModelArtifacts']"
+                    }
+                  },
+                  "Resource": "arn:aws:states:::sagemaker:createModel",
+                  "Type": "Task",
+                  "End": true
+                }
+              }
+            }
+
+  # Create an ECR repo to use
+  ecrModelRepo:
+    Type: AWS::ECR::Repository
+
+  # A Lambda function that will create CodeCommit resources
+  createRepoLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: ecrModelRepo
+    Properties:
+      Code:
+        S3Bucket: !Sub ${AWS::Region}${S3ResourceBucket}
+        S3Key: !Sub '${S3PathPrefix}/scripts/createRepo.zip'
+      Handler: "index.lambda_handler"
+      Timeout: 30
+      MemorySize: 512
+      Role: !GetAtt createRepoLambdaRole.Arn
+      Runtime: python3.7
+
+  # Call the Lambda function and pass in all the variables it will ever desire
+  createRepoLambdaCaller:
+    Type: Custom::EnvSetupCaller
+    Properties:
+      ServiceToken: !GetAtt createRepoLambda.Arn
+      Region: !Sub ${AWS::Region}
+      bucketName: !Sub ${AWS::Region}${S3ResourceBucket}
+      keyPrefix: !Sub ${S3PathPrefix}
+      SageMakerRole: !GetAtt SageMakerRole.Arn
+      StepFunctionsRole: !GetAtt StepFunctionsRole.Arn
+      modelArtifactBucket: !Ref modelArtifactBucket
+      modelDataBucket: !Ref modelDataBucket
+      ecrBucket: !Ref ecrBucket
+      ecrModelRepo: !Ref ecrModelRepo
+      trainingStateMachine: !Ref trainingStateMachine
+      trainingStateMachineName: !GetAtt trainingStateMachine.Name
+      dynamoDBTable: !Ref DynamoDBTable
+      endpointWaitLambda: !GetAtt endpointWaitLambda.Arn
+      modelTestLambda: !GetAtt modelTestLambda.Arn
+      kmsKey: !Ref SageMakerKMSKey
+
+  createRepoLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - codecommit:CreateBranch
+                  - codecommit:CreateCommit
+                  - codecommit:CreateRepository
+                  - codecommit:DeleteRepository
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - s3:DeleteObjectVersion
+                  - s3:DeleteObject
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionConfiguration
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*createRepoLambda*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchDeleteImage
+                Resource: !GetAtt ecrModelRepo.Arn
+
+  # Model artifact bucket
+  modelArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt SageMakerKMSKey.Arn
+            BucketKeyEnabled: true
+
+  # Model data bucket with trigger for new training data
+  modelDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  -
+                    Name: suffix
+                    Value: train/iris.csv
+            Function: !GetAtt triggerModelTrainingLambda.Arn
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt SageMakerKMSKey.Arn
+            BucketKeyEnabled: true
+
+  # A Lambda function that will copy the example data (training/validation) files to S3
+  copyDataLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${AWS::Region}${S3ResourceBucket}
+        S3Key: !Sub '${S3PathPrefix}/scripts/copydata.zip'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt 'copyDataLambdaRole.Arn'
+      Runtime: python3.7
+      Timeout: 900
+      MemorySize: 128
+
+  # Call the Lambda function to tell it to copy the data to the S3 buckets
+  copyDataLambdaCaller:
+    Type: Custom::EnvSetupCaller
+    Properties:
+      ServiceToken: !GetAtt copyDataLambda.Arn
+      sourceBucket: !Sub ${AWS::Region}${S3ResourceBucket}
+      destinationBucket: !Ref modelDataBucket
+      keyPrefix: !Sub ${S3PathPrefix}
+    DependsOn:
+      - ecrModelRepo
+
+  copyDataLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - s3:DeleteObject
+                  - s3:PutObject
+                Resource: '*'
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: states.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                  - iam:PassRole
+                  - kms:CreateGrant
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - lambda:InvokeFunction
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - s3:PutObject
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                  - sagemaker:UpdateEndpoint
+                  - codepipeline:PutJobFailureResult
+                  - codepipeline:PutJobSuccessResult
+                Resource: '*'
+              - Effect: Allow
+                Action: 
+                  - states:UpdateStateMachine
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:trainingStateMachine*'
+              - Effect: Allow
+                Action: 
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/*'
+              - Effect: Allow
+                Action: 
+                  - sagemaker:CreateEndpointConfig
+                Resource: 
+                  - !Sub arn:aws:sagemaker:*:${AWS::AccountId}:endpoint-config/*
+                Condition:
+                  ForAllValues:StringLike:
+                    sagemaker:InstanceTypes:
+                      - ml.t2.large
+                      - ml.t2.medium
+                      - ml.m5.large
+                      - ml.m4.large
+
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: sagemaker.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - cloudwatch:PutMetricData
+                  - codepipeline:PutJobFailureResult
+                  - codepipeline:PutJobSuccessResult
+                  - events:DescribeRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - iam:PassRole
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - s3:PutObject
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                  - sagemaker:UpdateEndpoint
+                  - states:UpdateStateMachine
+                Resource: '*'
+              - Effect: Allow
+                Action: 
+                  - sagemaker:CreateEndpointConfig
+                Resource: 
+                  - !Sub arn:aws:sagemaker:*:${AWS::AccountId}:endpoint-config/*
+                Condition:
+                  ForAllValues:StringLike:
+                    sagemaker:InstanceTypes:
+                      - ml.t2.large
+                      - ml.t2.medium
+                      - ml.m5.large
+                      - ml.m4.large
+
+  # Create a KMS key to encrypt all the data
+  SageMakerKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key used to encrypt SageMaker training jobs
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: SageMakerKey
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+
+  # Create a DynamoDB table to act as an artifact registry
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions:
+        - AttributeName: "RunId"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "RunId"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "1"
+        WriteCapacityUnits: "1"
+      StreamSpecification:
+        StreamViewType: "NEW_IMAGE"
+
+  # A Lambda function that will trigger training when new data files are uploaded to the S3 data bucket
+  triggerModelTrainingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${AWS::Region}${S3ResourceBucket}
+        S3Key: !Sub '${S3PathPrefix}/scripts/triggerModelTraining.zip'
+      Handler: "index.lambda_handler"
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt triggerModelTrainingLambdaRole.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          DynamoDBTable: !Sub ${DynamoDBTable}
+          ecrModelRepo: !Sub ${ecrModelRepo}
+          trainingStateMachine: !Sub ${trainingStateMachine}
+
+  triggerModelTrainingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - states:StartExecution
+                  - states:StopExecution
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Set permissions on the Lambda function so that it can be triggered by S3
+  triggerModelTrainingLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt triggerModelTrainingLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # A Lambda function that will check to see if the SageMaker endpoint is in service
+  # or not. If it is not it returns a fail so the step function will try again after
+  # the set delay.
+  endpointWaitLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: 
+        S3Bucket: !Sub ${AWS::Region}${S3ResourceBucket}
+        S3Key: !Sub '${S3PathPrefix}/scripts/endpointWait.zip'
+      Handler: "index.lambda_handler"
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt endpointWaitLambdaRole.Arn
+      Runtime: python3.8
+
+  endpointWaitLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - states:StartExecution
+                  - states:StopExecution
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda layers to reduce files size of the repo and make things reuseable
+  numpyLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+      Content:
+        S3Bucket: aws-tc-largeobjects
+        S3Key: lambdaLayers/numpyLibraryPython38.zip
+      Description: NumPy v1.19.4
+
+  pandasLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+      Content:
+        S3Bucket: aws-tc-largeobjects
+        S3Key: lambdaLayers/pandasLibraryPython38.zip
+      Description: Pandas v1.1.5
+
+  sagemakerLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+      Content:
+        S3Bucket: aws-tc-largeobjects
+        S3Key: lambdaLayers/sagemakerLibraryPython38.zip
+      Description: Sagemaker SDK v2.23.0
+
+  # A Lambda function that tests the model to see its accuracy
+  modelTestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: 
+        S3Bucket: !Sub ${AWS::Region}${S3ResourceBucket}
+        S3Key: !Sub '${S3PathPrefix}/scripts/modelTest.zip'
+      Handler: "index.lambda_handler"
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt modelTestLambdaRole.Arn
+      Runtime: python3.8
+      Layers:
+        - !Ref numpyLayer
+        - !Ref pandasLayer
+
+  modelTestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - sagemaker:InvokeEndpoint
+                  - states:StartExecution
+                  - states:StopExecution
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action: 
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/*'
+
+
+  # IAM Role for the model
+  ProductionModelRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: sagemaker.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - cloudwatch:PutMetricData
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # IAM Role for the CloudFormation to use to create the model
+  ProductionCloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AllowAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - cloudwatch:PutMetricData
+                  - iam:PassRole
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:CreateModel
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                Resource: 
+                  - !Sub arn:aws:sagemaker:*:${AWS::AccountId}:endpoint-config/*
+                  - !Sub arn:aws:sagemaker:*:${AWS::AccountId}:endpoint/*
+                  - !Sub arn:aws:sagemaker:*:${AWS::AccountId}:model/*
+              - Effect: Allow
+                Action: 
+                  - sagemaker:CreateEndpointConfig
+                Resource: 
+                  - !Sub arn:aws:sagemaker:*:${AWS::AccountId}:endpoint-config/*
+                Condition:
+                  ForAllValues:StringLike:
+                    sagemaker:InstanceTypes:
+                      - ml.t2.large
+                      - ml.t2.medium
+                      - ml.m5.large
+                      - ml.m4.large
+
+  ManualApprovalSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: ManualApprovalSNSTopic
+
+  ReadOnlyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+  GroupAssignment:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref ReadOnlyGroup
+      Users:
+        - Alejandro_Robles
+        - Greg_Gompers
+
+  CommandHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for the Command Host Instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref labVPC
+
+  CommandHostInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT5M
+    DependsOn:
+      - PublicRouteTableAssociationA
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - Dependencies
+            - AWS
+            - Workspace
+            - SSM
+        Dependencies:
+          commands:
+            1-Update-Yum-Packages:
+              command: yum update -y
+        AWS:
+          commands:
+            1-AWS-Default-Region:
+              command: !Sub sudo -u ec2-user aws configure set default.region ${AWS::Region}
+        Workspace:
+          commands:
+            1-Update-Ownership:
+              command: chown -R ec2-user:ec2-user /home/ec2-user
+        SSM:
+          users:
+            ssm-user:
+              uid: 1001
+              homeDir: /home/ssm-user
+          files:
+            /etc/sudoers.d/ssm-agent-users:
+              content: |
+                # User rules for ssm-user
+                ssm-user ALL=(ALL) NOPASSWD:ALL
+              mode: "000440"
+          commands:
+            1-Copy-Home-Directory:
+              command: cp -a /home/ec2-user /home/ssm-user
+            2-Change-Ownership:
+              command: chown -R ssm-user:ssm-user /home/ssm-user
+    Properties:
+      IamInstanceProfile: !Ref CommandHostInstanceProfile
+      ImageId: !Ref LinuxAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnetA
+          GroupSet:
+            - !Ref CommandHostSecurityGroup
+      Tags:
+        - Key: Name
+          Value: CommandHost
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -x
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init --stack ${AWS::StackName} --region ${AWS::Region} --resource CommandHostInstance
+          /opt/aws/bin/cfn-signal --stack ${AWS::StackName} --region ${AWS::Region} --resource CommandHostInstance --exit-code $?
+
+  CommandHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: LabDataBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:ReEncryptFrom
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:CreateModel
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                  - sagemaker:InvokeEndpoint
+                Resource: '*'
+
+  CommandHostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref CommandHostRole
+
+## ------------------------------ ##
+## Start fraud monitoring section ## 
+## ------------------------------ ##
+
+  fraudFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: !Sub lambdaLogsCreatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+        - PolicyName: !Sub lambdaLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+        - PolicyName: GeneralAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - codePipeline:DeletePipeline
+                  - codePipeline:StopPipelineExecution
+                  - codebuild:BatchDeleteBuilds
+                  - codeBuild:StopBuild
+                  - codeBuild:DeleteProject
+                  - codeBuild:UpdateProject
+                Resource: 
+                  - '*'
+      Tags:
+        - Key: !Ref fraudResourceTag
+          Value: !Ref fraudResourceTag
+
+  # Overwrite CodeBuild settings. Limits timeout, concurrent runs, and instance type
+  # Stop builds is threshold is passed
+  fraudFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt fraudFunctionRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 300
+      Environment:
+        Variables:
+          maxBuildJobs: !Ref maxBuildJobs
+          buildTimeout: !Ref buildTimeout
+          fraudTimeout: !Ref fraudTimeout
+      Code:
+        ZipFile: !Sub |
+          import boto3, os
+          import logging, json
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          codeBuild = boto3.client('codebuild')
+          fraudTimeout = int(os.environ['fraudTimeout'])
+          buildTimeout = int(os.environ['buildTimeout'])
+
+          def updateProjects(token=None):
+            # Get all project names
+            if token != None:
+              projects = codeBuild.list_projects(nextToken=token)
+            else:
+              projects = codeBuild.list_projects()
+
+            # For each project, set max concurrent and run time 
+            for project in projects['projects']:
+              updateCodeBuild = False
+              response = codeBuild.batch_get_projects(names=[project])
+              logger.info(json.dumps(response, default=str))
+              del response['projects'][0]['arn']
+              del response['projects'][0]['created']
+              del response['projects'][0]['lastModified']
+              del response['projects'][0]['badge']
+              if (response['projects'][0]['timeoutInMinutes'] != fraudTimeout or
+                  response['projects'][0]['queuedTimeoutInMinutes'] != fraudTimeout or
+                  response['projects'][0]['concurrentBuildLimit'] != 1 or
+                  response['projects'][0]['environment']['computeType'] != 'BUILD_GENERAL1_SMALL'):
+                updateCodeBuild = True
+              if updateCodeBuild:
+                response['projects'][0]['timeoutInMinutes']=buildTimeout
+                response['projects'][0]['queuedTimeoutInMinutes']=buildTimeout
+                response['projects'][0]['concurrentBuildLimit']=1
+                response['projects'][0]['environment']['computeType']='BUILD_GENERAL1_SMALL'
+                logger.info(json.dumps(response['projects'][0]))
+                updateResponse = codeBuild.update_project(**response['projects'][0])
+
+            # Loop until you go through all the tokens
+            if 'token' in projects:
+              updateProjects(projects['token'])
+
+          def countBuilds(nextToken=None, activeBuilds=0):
+            if nextToken != None:
+              buildsRet = codeBuild.list_builds(nextToken=nextToken)
+            else:
+              buildsRet = codeBuild.list_builds()
+            logger.debug(json.dumps(buildsRet))
+            response = codeBuild.batch_get_builds(ids=buildsRet['ids'])
+            logger.debug(json.dumps(response, default=str))
+
+            for build in response['builds']:
+              logger.debug(f'buildId: {build["id"]}')
+              logger.debug(f'build status: {build["buildStatus"]}')
+              logger.debug(f'build timeout: {build["timeoutInMinutes"]}')
+              logger.debug(f'build computeType: {build["environment"]["computeType"]}')
+              if build['buildStatus'] == 'IN_PROGRESS':
+                activeBuilds += 1
+                
+              # If there is a build running that has a high timeout or large compute type, stop it.
+              if build["timeoutInMinutes"] > fraudTimeout or build["environment"]["computeType"] != 'BUILD_GENERAL1_SMALL':
+                logger.warning(f'There is a build on the wrong instance class that will run to long. Stopping build: {build["id"]}')
+                codeBuild.stop_build(id=build['id'])
+                codeBuild.batch_delete_builds(ids=[build['id']])
+
+            if 'nextToken' in buildsRet:
+              countBuilds(buildsRet['nextToken'],activeBuilds)
+            logger.info('Finished counting CodeBuild builds')
+            logger.info(f'Active builds: {activeBuilds}')
+
+            return activeBuilds
+
+          def endCodeBuildBuilds(nextToken=None):
+            logger.info('Stopping CodeBuild builds')
+            if nextToken != None:
+              buildsRet = codeBuild.list_builds(nextToken=nextToken)
+            else:
+              buildsRet = codeBuild.list_builds()
+            #stop all builds
+
+            buildDetails = codeBuild.batch_get_builds(ids=buildsRet['ids'])
+            for build in buildsRet['ids']:
+              logger.warning(f'Stopping BuildId: {build} ')
+              codeBuild.stop_build(id=build)
+
+            logger.info('batch_delete_builds')
+            logger.info(json.dumps(buildsRet['ids']))
+            codeBuild.batch_delete_builds(ids=buildsRet['ids'])
+
+            if 'nextToken' in buildsRet:
+              endCodeBuildBuilds(buildsRet['nextToken'])
+            logger.info('Finished stopping CodeBuild builds')
+
+          def endCodePipelines(nextToken=None):
+            codePipeline = boto3.client('codepipeline')
+
+            if nextToken != None:
+              cpRet = codePipeline.list_pipelines(nextToken=nextToken)
+            else:
+              cpRet = codePipeline.list_pipelines()
+
+            # When build stops, pipeline fails, no need for this.
+            for pipeline in cpRet['pipelines']:
+              exeRet = codePipeline.list_pipeline_executions(pipelineName=pipeline['name'])
+              logger.info(json.dumps(exeRet, default=str))
+              for exe in exeRet['pipelineExecutionSummaries']:
+                logger.warning('Stopping pipeline executionId: '+exe['pipelineExecutionId'])
+                try:
+                  codePipeline.stop_pipeline_execution(
+                    pipelineName=pipeline['name'],
+                    pipelineExecutionId=exe['pipelineExecutionId'],
+                    abandon=True
+                    )
+                except:
+                  logger.info('no pipeline to stop')
+
+            if 'nextToken' in cpRet:
+              endCodePipelines(cpRet['nextToken'])
+            logger.info('Finished removing CodePipelines')
+
+          def handler(event, context):
+            # Log debug information
+            logger.info(json.dumps(event))
+            
+            # Update the project to have correct tiemout, concurrent limit, and compute type
+            # Do this every time 
+            updateProjects()
+
+            if event['detail-type'] == 'CodeBuild Build State Change':
+              # Determine how many active builds there are
+              activeBuilds = countBuilds()
+            
+              # If there are more than x active builds, end the builds and pipelines
+              if activeBuilds > int(os.environ['maxBuildJobs']):
+                endCodeBuildBuilds()
+                endCodePipelines()
+      Tags:
+        - Key: !Ref fraudResourceTag
+          Value: !Ref fraudResourceTag
+
+  fraudFunctionRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      EventPattern: 
+        source: 
+          - "aws.codebuild"
+        detail-type: 
+          - "CodeBuild Build State Change"
+        detail: 
+          build-status:
+            - "IN_PROGRESS"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt fraudFunction.Arn
+          Id: !Ref fraudFunction
+
+  fraudFunctionCodePipelineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: 
+        source: 
+          - "aws.codepipeline"
+        detail-type: 
+          - "CodePipeline Stage Execution State Change"
+        detail: 
+          state:
+            - "STARTED"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt fraudFunction.Arn
+          Id: !Ref fraudFunction
+
+  fraudFunctionRulePermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref fraudFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt fraudFunctionRule.Arn
+
+  fraudFunctionCodePipelineRulePermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref fraudFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt fraudFunctionCodePipelineRule.Arn
+
+  # Add tags to events so they can be protected by the policy
+  # This Lambda can delete itself if you program it to.
+  maintenanceLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: This Lambda function handles creation logic that CF can't handle
+      Code:
+        ZipFile: |
+          import boto3, json
+          import cfnresponse
+          
+          def handler(event, context):
+            try:
+              print(event);
+              tag = event['ResourceProperties']['fraudResourceTag'];
+              resource = event['ResourceProperties']['resource']
+              if event["RequestType"] == 'Create':
+                client = boto3.client('resourcegroupstaggingapi')
+                
+                client.tag_resources(
+                  ResourceARNList=resource,
+                  Tags={
+                      tag: tag
+                  }
+                )
+                msg = "Tagged Resources"
+                responseData = {}
+                responseData['Data'] = msg
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, event["LogicalResourceId"]);
+              else:
+                msg = "No work to do"
+                responseData = {}
+                responseData['Data'] = msg
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, event["LogicalResourceId"]);
+            except Exception as e:
+              msg = f"Exception raised for function: Exception details: {e}"
+              responseData = {}
+              responseData['Data'] = msg
+              cfnresponse.send(event, context, cfnresponse.FAILED, responseData, event["LogicalResourceId"]);
+              
+      Handler: index.handler
+      Role: !GetAtt 'maintenanceLambdaRole.Arn'
+      Runtime: python3.7
+      Timeout: 500
+
+  maintenanceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: lambdaLogsCreatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+        - PolicyName: lambdaLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+        - PolicyName: lambdaS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:TagResource
+                  - tag:TagResources
+                Resource: '*'
+
+  #Custom maintenance function.
+  maintenanceLambdaCaller:
+    Type: Custom::EnvSetupCaller
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt maintenanceLambda.Arn
+      fraudResourceTag: !Ref fraudResourceTag
+      resource: 
+        - !GetAtt fraudFunctionRule.Arn
+        - !GetAtt fraudFunctionCodePipelineRule.Arn
+
+## ------------------------------ ##
+##  End fraud monitoring section  ## 
+## ------------------------------ ##
+
+Outputs:
+  modelArtifactBucket:
+    Description: This is the path for the artifact bucket with training data
+    Value: !Sub ${modelArtifactBucket}
+  ProductionModelRole:
+    Description: This is the Arn of the ProductionModelRole used by CloudFormation
+    Value: !GetAtt ProductionModelRole.Arn
+  ECRModelRepo:
+    Description: This is the ECR repo that the image is saved in
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrModelRepo}
+  AWSRegion:
+    Description: The AWS Region
+    Value: !Sub ${AWS::Region}
+  CommandHostSessionUrl:
+    Description: The URL to the Session Management Console for the command host.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${CommandHostInstance}?region=${AWS::Region}
