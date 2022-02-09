@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Deploy trained ML model to production'
+
+Parameters:
+  S3Bucket:
+    Description: 'Name of the S3 bucket where the model artifact is stored'
+    Type: String
+    Default: 'none'
+  ProductionModelRole:
+    Description: 'The Arn of the ProductionModelRole used by CloudFormation'
+    Type: String
+    Default: 'none'
+  TrainingJob:
+    Description: 'The name of the training job'
+    Type: String
+    Default: 'none'
+  ECRImage:
+    Description: 'The ERC image URI:Tag'
+    Type: String
+    Default: 'none'
+  InstanceType:
+    Description: 'The instance type for the endpoint'
+    Type: String
+    Default: 'ml.m5.large'
+    AllowedValues:
+      - 'ml.m4.large'
+      - 'ml.m5.large'
+      - 'ml.t2.large'
+      - 'ml.t2.medium'
+
+Resources:
+  # Create a model
+  ProductionModel:
+    Type: AWS::SageMaker::Model
+    Properties: 
+      ExecutionRoleArn: !Ref ProductionModelRole
+      PrimaryContainer: 
+        Image: !Ref ECRImage
+        Mode: SingleModel
+        ModelDataUrl: !Sub s3://${S3Bucket}/${TrainingJob}/output/model.tar.gz
+
+  # Create an endpoint configuration
+  ProductionEndpointConfiguration:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties: 
+      ProductionVariants: 
+        - InitialInstanceCount: 1
+          InitialVariantWeight: 1.0
+          InstanceType: !Ref InstanceType
+          ModelName: !GetAtt ProductionModel.ModelName
+          VariantName: !GetAtt ProductionModel.ModelName
+
+  # Create an endpoint
+  ProductionEndpoint:
+    Type: "AWS::SageMaker::Endpoint"
+    Properties:
+      EndpointConfigName: !GetAtt ProductionEndpointConfiguration.EndpointConfigName
+
+Outputs:
+  EndpointId:
+    Value: !Ref ProductionEndpoint
+  EndpointName:
+    Value: !GetAtt ProductionEndpoint.EndpointName
+  EndpointURL:
+    Value: !Sub https://runtime.sagemaker.${AWS::Region}.amazonaws.com/endpoints/${ProductionEndpoint}/invocations

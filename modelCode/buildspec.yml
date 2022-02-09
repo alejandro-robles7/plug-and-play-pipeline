@@ -1,0 +1,31 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - echo `python --version`
+      - echo `aws --version`
+      # - $(aws ecr get-login --no-include-email --region [Region]) 
+      # This is the command that is supposed to work with aws cli v2
+      # It looks like CodeBuild rolled back the cli v2 update 11/23
+      - aws ecr get-login-password --region [Region] | docker login --username AWS --password-stdin [AccountId].dkr.ecr.[Region].amazonaws.com
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the Docker image...          
+      - echo Path `pwd` 
+      - echo Permissions `ls -la` 
+      - chmod -R 775 ml_service 
+      - echo Decision Tree Permissions `cd ml_service && ls -la`
+      # $IMAGE_NAME is defined as an environmental variable for the build project
+      - docker build -t $IMAGE_NAME:$RunId . 
+      - docker tag $IMAGE_NAME:$RunId $ECR_URI:$RunId
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing the Docker image...
+      - docker push $ECR_URI:$RunId
+      - sf='[trainingStateMachine]'
+      - result=null
+      - while [ "$result" = null ]; do sleep 10; result=$(aws stepfunctions describe-state-machine --state-machine-arn $sf | jq -r ".definition" | jq -r '.States."Create Endpoint"'); done
